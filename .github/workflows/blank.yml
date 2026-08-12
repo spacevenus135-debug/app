@@ -16,9 +16,6 @@ env:
   COMPILE_SDK: '34'
 
 jobs:
-  # ─────────────────────────────────────────────
-  #  BUILD
-  # ─────────────────────────────────────────────
   build:
     name: Build APK
     runs-on: ubuntu-latest
@@ -33,14 +30,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ── Unzip project if repo contains a zip ──────────────────────────────
       - name: Unzip project if needed
         run: |
           ZIP=$(find . -maxdepth 2 -name "*.zip" | head -1)
           if [ -n "$ZIP" ]; then
             echo "Found zip: $ZIP — extracting..."
             unzip -o "$ZIP" -d extracted/
-            # move contents up if there's a single wrapper folder
             INNER=$(ls extracted/ | head -1)
             if [ $(ls extracted/ | wc -l) -eq 1 ] && [ -d "extracted/$INNER" ]; then
               cp -r extracted/$INNER/. .
@@ -78,14 +73,22 @@ jobs:
             "platforms;android-${{ env.COMPILE_SDK }}" \
             "build-tools;${{ env.BUILD_TOOLS_VERSION }}"
 
-      # gradlew missing from zip → generate it via wrapper task
       - name: Generate gradlew if missing
         run: |
           if [ ! -f "./gradlew" ]; then
-            echo "gradlew not found — generating via gradle wrapper task"
-            gradle wrapper \
-              --gradle-version=8.4 \
+            echo "gradlew not found — bootstrapping Gradle 8.4 binary"
+            GRADLE_VERSION="8.4"
+            wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
+                 -O /tmp/gradle.zip
+            unzip -q /tmp/gradle.zip -d /tmp/gradle-dist
+            GRADLE_BIN="/tmp/gradle-dist/gradle-${GRADLE_VERSION}/bin/gradle"
+            chmod +x "$GRADLE_BIN"
+            "$GRADLE_BIN" wrapper \
+              --gradle-version="${GRADLE_VERSION}" \
               --distribution-type=bin
+            echo "gradlew generated"
+          else
+            echo "gradlew already present"
           fi
           chmod +x ./gradlew
 
@@ -138,15 +141,6 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
           retention-days: 30
 
-  # ─────────────────────────────────────────────
-  #  SIGN  (push to main/master only)
-  #
-  #  Secrets needed:
-  #    KEYSTORE_BASE64    → base64 of your .jks file
-  #    KEYSTORE_PASSWORD  → keystore password
-  #    KEY_ALIAS          → key alias
-  #    KEY_PASSWORD       → key password
-  # ─────────────────────────────────────────────
   sign:
     name: Sign Release APK
     runs-on: ubuntu-latest
@@ -198,7 +192,6 @@ jobs:
           UNSIGNED=$(ls apk/*.apk | head -1)
           SIGNED="apk/StopClock-${VER}-b${BLD}-signed.apk"
           ALIGNED="apk/StopClock-${VER}-b${BLD}-signed-aligned.apk"
-
           jarsigner \
             -verbose \
             -sigalg SHA256withRSA \
@@ -209,10 +202,8 @@ jobs:
             -signedjar "$SIGNED" \
             "$UNSIGNED" \
             "$KA"
-
           $ANDROID_HOME/build-tools/${{ env.BUILD_TOOLS_VERSION }}/zipalign \
             -v 4 "$SIGNED" "$ALIGNED"
-
           $ANDROID_HOME/build-tools/${{ env.BUILD_TOOLS_VERSION }}/apksigner \
             verify --verbose "$ALIGNED"
 
@@ -234,9 +225,6 @@ jobs:
             ${{ github.event.head_commit.message }}
           files: apk/*-signed-aligned.apk
 
-  # ─────────────────────────────────────────────
-  #  SUMMARY
-  # ─────────────────────────────────────────────
   summary:
     name: Summary
     runs-on: ubuntu-latest
