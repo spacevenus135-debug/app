@@ -92,6 +92,15 @@ jobs:
           fi
           chmod +x ./gradlew
 
+      - name: Patch gradle.properties
+        run: |
+          PROPS="gradle.properties"
+          touch "$PROPS"
+          grep -q "android.useAndroidX" "$PROPS" || echo "android.useAndroidX=true" >> "$PROPS"
+          grep -q "android.enableJetifier" "$PROPS" || echo "android.enableJetifier=true" >> "$PROPS"
+          grep -q "org.gradle.jvmargs"    "$PROPS" || echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8" >> "$PROPS"
+          cat "$PROPS"
+
       - name: Extract version
         id: version
         run: |
