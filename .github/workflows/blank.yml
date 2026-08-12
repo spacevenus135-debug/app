@@ -1,255 +1,186 @@
-name: Build StopClock APK
+name: Boosteroid APK Extract
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
-
-permissions:
-  contents: write
-
-env:
-  JAVA_VERSION: '17'
-  BUILD_TOOLS_VERSION: '34.0.0'
-  COMPILE_SDK: '34'
+    inputs:
+      apk_url:
+        description: 'Direct APK download URL (optional)'
+        required: false
+        default: ''
 
 jobs:
-  build:
-    name: Build APK
+  extract:
     runs-on: ubuntu-latest
 
-    outputs:
-      version_name: ${{ steps.version.outputs.version_name }}
-      version_code: ${{ steps.version.outputs.version_code }}
-
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Unzip project if needed
-        run: |
-          ZIP=$(find . -maxdepth 2 -name "*.zip" | head -1)
-          if [ -n "$ZIP" ]; then
-            echo "Found zip: $ZIP — extracting..."
-            unzip -o "$ZIP" -d extracted/
-            INNER=$(ls extracted/ | head -1)
-            if [ $(ls extracted/ | wc -l) -eq 1 ] && [ -d "extracted/$INNER" ]; then
-              cp -r extracted/$INNER/. .
-            else
-              cp -r extracted/. .
-            fi
-            echo "Extracted successfully"
-          else
-            echo "No zip found — assuming project is already at root"
-          fi
-
-      - name: Set up JDK
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: 'temurin'
-          cache: 'gradle'
+          distribution: temurin
+          java-version: '17'
 
-      - name: Cache Gradle
-        uses: actions/cache@v4
+      - name: Download JADX
+        run: |
+          JADX_VER=$(curl -s https://api.github.com/repos/skylot/jadx/releases/latest \
+            | grep '"tag_name"' | cut -d'"' -f4)
+          curl -L "https://github.com/skylot/jadx/releases/download/${JADX_VER}/jadx-${JADX_VER#v}.zip" \
+            -o jadx.zip
+          unzip -q jadx.zip -d jadx
+          chmod +x jadx/bin/jadx
+          echo "$PWD/jadx/bin" >> $GITHUB_PATH
+
+      - name: Download Boosteroid APK
+        run: |
+          APK_URL="${{ github.event.inputs.apk_url }}"
+          if [ -z "$APK_URL" ]; then
+            APK_URL=$(curl -sL "https://apkpure.com/boosteroid-cloud-gaming/com.boosteroid" \
+              | grep -oP 'https://[^"]+\.apk' | head -1)
+          fi
+          curl -L "$APK_URL" -o boosteroid.apk
+
+      - name: Decompile APK
+        run: |
+          jadx --threads-count 4 --output-dir decompiled boosteroid.apk
+
+      # ── EXTRACT + SAVE CLEAN FILE ─────────────────────────────────────
+      - name: Extract and save credentials
+        run: |
+          python3 << 'PYEOF'
+          import os, re, json
+          from pathlib import Path
+
+          ROOT = Path("decompiled")
+          OUT  = Path("credentials.txt")
+          JSON = Path("credentials.json")
+
+          # ── patterns to hunt ─────────────────────────────────────────
+          PATTERNS = {
+              "client_id": [
+                  r'client[_-]?id["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-\.]{6,})',
+                  r'clientId["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-\.]{6,})',
+                  r'CLIENT_ID["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-\.]{6,})',
+                  r'app[_-]?id["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-\.]{6,})',
+              ],
+              "client_secret": [
+                  r'client[_-]?secret["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9+/=_\-]{8,})',
+                  r'clientSecret["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9+/=_\-]{8,})',
+                  r'CLIENT_SECRET["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9+/=_\-]{8,})',
+                  r'app[_-]?secret["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9+/=_\-]{8,})',
+              ],
+              "api_key": [
+                  r'api[_-]?key["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-]{10,})',
+                  r'API_KEY["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-]{10,})',
+                  r'apiKey["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-]{10,})',
+              ],
+              "oauth_token": [
+                  r'Bearer\s+([A-Za-z0-9\._\-]{20,})',
+                  r'access[_-]?token["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9\._\-]{20,})',
+                  r'oauth[_-]?token["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9\._\-]{20,})',
+              ],
+              "base_url": [
+                  r'(https?://[a-zA-Z0-9._\-]+\.boosteroid[^\s"\'`<>]{0,60})',
+                  r'BASE_URL["\'`\s]*[:=]+["\'`\s]*(https?://[^\s"\'`]{8,})',
+                  r'baseUrl["\'`\s]*[:=]+["\'`\s]*(https?://[^\s"\'`]{8,})',
+              ],
+              "grant_type": [
+                  r'grant[_-]?type["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_]{4,})',
+              ],
+          }
+
+          # skip these junk values
+          SKIP_VALUES = {
+              "null","true","false","string","int","boolean",
+              "object","array","example","test","none","",
+          }
+
+          found = {k: {} for k in PATTERNS}   # key → {value: [files]}
+
+          exts = {".java",".kt",".xml",".json",".smali",".properties",".gradle"}
+
+          for fpath in ROOT.rglob("*"):
+              if not fpath.is_file(): continue
+              if fpath.suffix.lower() not in exts: continue
+              try:
+                  content = fpath.read_text(errors="ignore")
+              except Exception:
+                  continue
+
+              rel = str(fpath.relative_to(ROOT))
+
+              for key, pats in PATTERNS.items():
+                  for pat in pats:
+                      for m in re.finditer(pat, content, re.IGNORECASE):
+                          val = m.group(1).strip().strip('"\'`')
+                          if val.lower() in SKIP_VALUES: continue
+                          if len(val) < 4: continue
+                          if val not in found[key]:
+                              found[key][val] = []
+                          if rel not in found[key][val]:
+                              found[key][val].append(rel)
+
+          # ── also grab full BuildConfig ───────────────────────────────
+          buildconfigs = list(ROOT.rglob("BuildConfig.java"))
+
+          # ── write clean credentials.txt ──────────────────────────────
+          lines = []
+          lines.append("╔══════════════════════════════════════════════════╗")
+          lines.append("║       Boosteroid Credential Extraction           ║")
+          lines.append("╚══════════════════════════════════════════════════╝")
+          lines.append("")
+
+          any_found = False
+          for key, vals in found.items():
+              if not vals: continue
+              any_found = True
+              lines.append(f"── {key.upper().replace('_',' ')} " + "─"*(46-len(key)))
+              for val, files in vals.items():
+                  lines.append(f"  VALUE : {val}")
+                  for f in files[:3]:   # max 3 source files per value
+                      lines.append(f"  FILE  : {f}")
+                  lines.append("")
+
+          if buildconfigs:
+              lines.append("── BUILDCONFIG.JAVA ────────────────────────────────")
+              for bc in buildconfigs:
+                  lines.append(f"\n  [{bc.relative_to(ROOT)}]")
+                  lines.append(bc.read_text(errors="ignore"))
+
+          if not any_found:
+              lines.append("  ⚠  No credentials matched — check deep_scan.txt")
+
+          OUT.write_text("\n".join(lines), encoding="utf-8")
+          print("\n".join(lines))
+
+          # ── write credentials.json (machine-readable) ────────────────
+          clean_json = {}
+          for key, vals in found.items():
+              if vals:
+                  # take unique values as list
+                  clean_json[key] = list(vals.keys())
+
+          JSON.write_text(
+              json.dumps(clean_json, indent=2, ensure_ascii=False),
+              encoding="utf-8"
+          )
+          print(f"\n✅ Saved: {OUT}  ({OUT.stat().st_size} bytes)")
+          print(f"✅ Saved: {JSON}  ({JSON.stat().st_size} bytes)")
+          PYEOF
+
+      - name: Upload credentials
+        uses: actions/upload-artifact@v4
         with:
+          name: boosteroid-credentials
           path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: ${{ runner.os }}-gradle-
+            credentials.txt
+            credentials.json
+          retention-days: 7
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install SDK components
+      - name: Summary
         run: |
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-${{ env.COMPILE_SDK }}" \
-            "build-tools;${{ env.BUILD_TOOLS_VERSION }}"
-
-      - name: Generate gradlew if missing
-        run: |
-          if [ ! -f "./gradlew" ]; then
-            echo "gradlew not found — bootstrapping Gradle 8.4 binary"
-            GRADLE_VERSION="8.4"
-            wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
-                 -O /tmp/gradle.zip
-            unzip -q /tmp/gradle.zip -d /tmp/gradle-dist
-            GRADLE_BIN="/tmp/gradle-dist/gradle-${GRADLE_VERSION}/bin/gradle"
-            chmod +x "$GRADLE_BIN"
-            "$GRADLE_BIN" wrapper \
-              --gradle-version="${GRADLE_VERSION}" \
-              --distribution-type=bin
-            echo "gradlew generated"
-          else
-            echo "gradlew already present"
-          fi
-          chmod +x ./gradlew
-
-      - name: Patch gradle.properties
-        run: |
-          PROPS="gradle.properties"
-          touch "$PROPS"
-          grep -q "android.useAndroidX" "$PROPS" || echo "android.useAndroidX=true" >> "$PROPS"
-          grep -q "android.enableJetifier" "$PROPS" || echo "android.enableJetifier=true" >> "$PROPS"
-          grep -q "org.gradle.jvmargs"    "$PROPS" || echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8" >> "$PROPS"
-          cat "$PROPS"
-
-      - name: Extract version
-        id: version
-        run: |
-          VN=$(grep 'versionName' app/build.gradle | head -1 \
-               | sed 's/.*versionName[[:space:]]*"\([^"]*\)".*/\1/')
-          VC=$(grep 'versionCode' app/build.gradle | head -1 \
-               | sed 's/.*versionCode[[:space:]]*\([0-9]*\).*/\1/')
-          echo "version_name=${VN:-1.0}"  >> $GITHUB_OUTPUT
-          echo "version_code=${VC:-1}"    >> $GITHUB_OUTPUT
-          echo "Version: ${VN} (${VC})"
-
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
-
-      - name: Build Release APK (unsigned)
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
-
-      - name: Rename APKs
-        run: |
-          VER="${{ steps.version.outputs.version_name }}"
-          BLD="${{ github.run_number }}"
-          D=app/build/outputs/apk/debug
-          R=app/build/outputs/apk/release
-          [ -f "$D/app-debug.apk" ] && \
-            mv "$D/app-debug.apk" "$D/StopClock-${VER}-b${BLD}-debug.apk"
-          [ -f "$R/app-release-unsigned.apk" ] && \
-            mv "$R/app-release-unsigned.apk" "$R/StopClock-${VER}-b${BLD}-release-unsigned.apk"
-
-      - name: APK info
-        run: |
-          echo "── Debug ──────────────────────"
-          ls -lh app/build/outputs/apk/debug/*.apk 2>/dev/null || echo "not found"
-          echo "── Release ────────────────────"
-          ls -lh app/build/outputs/apk/release/*.apk 2>/dev/null || echo "not found"
-
-      - name: Upload Debug artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: StopClock-debug-b${{ github.run_number }}
-          path: app/build/outputs/apk/debug/*.apk
-          retention-days: 14
-
-      - name: Upload Release artifact (unsigned)
-        uses: actions/upload-artifact@v4
-        with:
-          name: StopClock-release-unsigned-b${{ github.run_number }}
-          path: app/build/outputs/apk/release/*.apk
-          retention-days: 30
-
-  sign:
-    name: Sign Release APK
-    runs-on: ubuntu-latest
-    needs: build
-    if: >-
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-
-    steps:
-      - name: Download unsigned APK
-        uses: actions/download-artifact@v4
-        with:
-          name: StopClock-release-unsigned-b${{ github.run_number }}
-          path: apk/
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: 'temurin'
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install build-tools
-        run: sdkmanager "build-tools;${{ env.BUILD_TOOLS_VERSION }}"
-
-      - name: Decode keystore
-        env:
-          KB64: ${{ secrets.KEYSTORE_BASE64 }}
-        run: |
-          if [ -z "$KB64" ]; then
-            echo "::warning::KEYSTORE_BASE64 not set — skipping signing"
-            echo "SKIP_SIGN=true" >> $GITHUB_ENV
-          else
-            echo "$KB64" | base64 --decode > stopclock.jks
-            echo "SKIP_SIGN=false" >> $GITHUB_ENV
-          fi
-
-      - name: Sign & zipalign APK
-        if: env.SKIP_SIGN == 'false'
-        env:
-          KP: ${{ secrets.KEYSTORE_PASSWORD }}
-          KK: ${{ secrets.KEY_PASSWORD }}
-          KA: ${{ secrets.KEY_ALIAS }}
-        run: |
-          VER="${{ needs.build.outputs.version_name }}"
-          BLD="${{ github.run_number }}"
-          UNSIGNED=$(ls apk/*.apk | head -1)
-          SIGNED="apk/StopClock-${VER}-b${BLD}-signed.apk"
-          ALIGNED="apk/StopClock-${VER}-b${BLD}-signed-aligned.apk"
-          jarsigner \
-            -verbose \
-            -sigalg SHA256withRSA \
-            -digestalg SHA-256 \
-            -keystore stopclock.jks \
-            -storepass "$KP" \
-            -keypass   "$KK" \
-            -signedjar "$SIGNED" \
-            "$UNSIGNED" \
-            "$KA"
-          $ANDROID_HOME/build-tools/${{ env.BUILD_TOOLS_VERSION }}/zipalign \
-            -v 4 "$SIGNED" "$ALIGNED"
-          $ANDROID_HOME/build-tools/${{ env.BUILD_TOOLS_VERSION }}/apksigner \
-            verify --verbose "$ALIGNED"
-
-      - name: Upload signed APK
-        if: env.SKIP_SIGN == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: StopClock-release-signed-b${{ github.run_number }}
-          path: apk/*-signed-aligned.apk
-          retention-days: 60
-
-      - name: GitHub Release (on version tag)
-        if: env.SKIP_SIGN == 'false' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          name: "StopClock v${{ needs.build.outputs.version_name }}"
-          body: |
-            Build #${{ github.run_number }} — ${{ github.sha }}
-            ${{ github.event.head_commit.message }}
-          files: apk/*-signed-aligned.apk
-
-  summary:
-    name: Summary
-    runs-on: ubuntu-latest
-    needs: [ build, sign ]
-    if: always()
-    steps:
-      - name: Write summary
-        run: |
-          {
-            echo "## StopClock Build Summary"
-            echo "| | |"
-            echo "|---|---|"
-            echo "| Build | #${{ github.run_number }} |"
-            echo "| Branch | \`${{ github.ref_name }}\` |"
-            echo "| Commit | \`${{ github.sha }}\` |"
-            echo "| By | ${{ github.actor }} |"
-            echo "| Build job | ${{ needs.build.result }} |"
-            echo "| Sign job | ${{ needs.sign.result }} |"
-          } >> $GITHUB_STEP_SUMMARY
+          echo "### 🔑 Extracted Credentials" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat credentials.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
