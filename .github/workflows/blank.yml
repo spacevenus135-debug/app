@@ -22,31 +22,37 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Download JADX
+      - name: Download JADX (fixed version)
         run: |
-          JADX_VER=$(curl -s https://api.github.com/repos/skylot/jadx/releases/latest \
-            | grep '"tag_name"' | cut -d'"' -f4)
-          curl -L "https://github.com/skylot/jadx/releases/download/${JADX_VER}/jadx-${JADX_VER#v}.zip" \
+          JADX_VERSION="1.4.7"
+          echo "📦 Downloading JADX v${JADX_VERSION}..."
+          curl -L "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" \
             -o jadx.zip
           unzip -q jadx.zip -d jadx
           chmod +x jadx/bin/jadx
           echo "$PWD/jadx/bin" >> $GITHUB_PATH
+          echo "✅ JADX installed successfully"
+          jadx/bin/jadx --version || echo "⚠️ Version check skipped"
 
       - name: Download Boosteroid APK
         run: |
           APK_URL="${{ github.event.inputs.apk_url }}"
           if [ -z "$APK_URL" ]; then
+            echo "🔍 No URL provided, fetching from APKPure..."
             APK_URL=$(curl -sL "https://apkpure.com/boosteroid-cloud-gaming/com.boosteroid" \
               | grep -oP 'https://[^"]+\.apk' | head -1)
           fi
+          echo "📥 Downloading from: $APK_URL"
           curl -L "$APK_URL" -o boosteroid.apk
+          ls -lh boosteroid.apk
 
-      - name: Decompile APK
+      - name: Decompile APK with JADX
         run: |
-          jadx --threads-count 4 --output-dir decompiled boosteroid.apk
+          echo "🔧 Decompiling APK..."
+          jadx/bin/jadx --threads-count 4 --output-dir decompiled boosteroid.apk
+          echo "✅ Decompiled $(find decompiled -name '*.java' | wc -l) Java files"
 
-      # ── EXTRACT + SAVE CLEAN FILE ─────────────────────────────────────
-      - name: Extract and save credentials
+      - name: Extract Client ID & Secret
         run: |
           python3 << 'PYEOF'
           import os, re, json
@@ -56,7 +62,6 @@ jobs:
           OUT  = Path("credentials.txt")
           JSON = Path("credentials.json")
 
-          # ── patterns to hunt ─────────────────────────────────────────
           PATTERNS = {
               "client_id": [
                   r'client[_-]?id["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-\.]{6,})',
@@ -85,20 +90,10 @@ jobs:
                   r'BASE_URL["\'`\s]*[:=]+["\'`\s]*(https?://[^\s"\'`]{8,})',
                   r'baseUrl["\'`\s]*[:=]+["\'`\s]*(https?://[^\s"\'`]{8,})',
               ],
-              "grant_type": [
-                  r'grant[_-]?type["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_]{4,})',
-              ],
           }
 
-          # skip these junk values
-          SKIP_VALUES = {
-              "null","true","false","string","int","boolean",
-              "object","array","example","test","none","",
-          }
-
-          found = {k: {} for k in PATTERNS}   # key → {value: [files]}
-
-          exts = {".java",".kt",".xml",".json",".smali",".properties",".gradle"}
+          found = {k: {} for k in PATTERNS}
+          exts = {".java", ".kt", ".xml", ".json", ".smali", ".properties", ".gradle"}
 
           for fpath in ROOT.rglob("*"):
               if not fpath.is_file(): continue
@@ -107,24 +102,17 @@ jobs:
                   content = fpath.read_text(errors="ignore")
               except Exception:
                   continue
-
               rel = str(fpath.relative_to(ROOT))
-
               for key, pats in PATTERNS.items():
                   for pat in pats:
                       for m in re.finditer(pat, content, re.IGNORECASE):
                           val = m.group(1).strip().strip('"\'`')
-                          if val.lower() in SKIP_VALUES: continue
                           if len(val) < 4: continue
                           if val not in found[key]:
                               found[key][val] = []
                           if rel not in found[key][val]:
                               found[key][val].append(rel)
 
-          # ── also grab full BuildConfig ───────────────────────────────
-          buildconfigs = list(ROOT.rglob("BuildConfig.java"))
-
-          # ── write clean credentials.txt ──────────────────────────────
           lines = []
           lines.append("╔══════════════════════════════════════════════════╗")
           lines.append("║       Boosteroid Credential Extraction           ║")
@@ -138,35 +126,23 @@ jobs:
               lines.append(f"── {key.upper().replace('_',' ')} " + "─"*(46-len(key)))
               for val, files in vals.items():
                   lines.append(f"  VALUE : {val}")
-                  for f in files[:3]:   # max 3 source files per value
+                  for f in files[:3]:
                       lines.append(f"  FILE  : {f}")
                   lines.append("")
 
-          if buildconfigs:
-              lines.append("── BUILDCONFIG.JAVA ────────────────────────────────")
-              for bc in buildconfigs:
-                  lines.append(f"\n  [{bc.relative_to(ROOT)}]")
-                  lines.append(bc.read_text(errors="ignore"))
-
           if not any_found:
-              lines.append("  ⚠  No credentials matched — check deep_scan.txt")
+              lines.append("  ⚠️ No credentials matched — try manual search")
 
           OUT.write_text("\n".join(lines), encoding="utf-8")
           print("\n".join(lines))
 
-          # ── write credentials.json (machine-readable) ────────────────
           clean_json = {}
           for key, vals in found.items():
               if vals:
-                  # take unique values as list
                   clean_json[key] = list(vals.keys())
-
-          JSON.write_text(
-              json.dumps(clean_json, indent=2, ensure_ascii=False),
-              encoding="utf-8"
-          )
-          print(f"\n✅ Saved: {OUT}  ({OUT.stat().st_size} bytes)")
-          print(f"✅ Saved: {JSON}  ({JSON.stat().st_size} bytes)")
+          JSON.write_text(json.dumps(clean_json, indent=2, ensure_ascii=False), encoding="utf-8")
+          print(f"✅ Saved: {OUT}")
+          print(f"✅ Saved: {JSON}")
           PYEOF
 
       - name: Upload credentials
