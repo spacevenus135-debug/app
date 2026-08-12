@@ -2,11 +2,6 @@ name: Boosteroid APK Extract
 
 on:
   workflow_dispatch:
-    inputs:
-      apk_url:
-        description: 'Direct APK download URL (optional)'
-        required: false
-        default: ''
 
 jobs:
   extract:
@@ -32,24 +27,29 @@ jobs:
           chmod +x jadx/bin/jadx
           echo "$PWD/jadx/bin" >> $GITHUB_PATH
           echo "✅ JADX installed successfully"
-          jadx/bin/jadx --version || echo "⚠️ Version check skipped"
 
-      - name: Download Boosteroid APK
+      - name: List APK files in repo
         run: |
-          APK_URL="${{ github.event.inputs.apk_url }}"
-          if [ -z "$APK_URL" ]; then
-            echo "🔍 No URL provided, fetching from APKPure..."
-            APK_URL=$(curl -sL "https://apkpure.com/boosteroid-cloud-gaming/com.boosteroid" \
-              | grep -oP 'https://[^"]+\.apk' | head -1)
+          echo "📁 Looking for APK files..."
+          find . -name "*.apk" -type f
+          echo ""
+          echo "📁 All files in root:"
+          ls -la
+
+      - name: Decompile APK from repo
+        run: |
+          # ابحث عن أي ملف APK في المستودع
+          APK_FILE=$(find . -name "*.apk" -type f | head -1)
+          if [ -z "$APK_FILE" ]; then
+            echo "❌ No APK file found in repository!"
+            echo "📁 Please upload an APK file to the repository root."
+            exit 1
           fi
-          echo "📥 Downloading from: $APK_URL"
-          curl -L "$APK_URL" -o boosteroid.apk
-          ls -lh boosteroid.apk
-
-      - name: Decompile APK with JADX
-        run: |
+          echo "📱 Found APK: $APK_FILE"
+          echo "📏 Size: $(du -h "$APK_FILE" | cut -f1)"
+          
           echo "🔧 Decompiling APK..."
-          jadx/bin/jadx --threads-count 4 --output-dir decompiled boosteroid.apk
+          jadx/bin/jadx --threads-count 4 --output-dir decompiled "$APK_FILE"
           echo "✅ Decompiled $(find decompiled -name '*.java' | wc -l) Java files"
 
       - name: Extract Client ID & Secret
@@ -130,8 +130,18 @@ jobs:
                       lines.append(f"  FILE  : {f}")
                   lines.append("")
 
+          # BuildConfig files
+          buildconfigs = list(ROOT.rglob("BuildConfig.java"))
+          if buildconfigs:
+              lines.append("── BUILDCONFIG.JAVA ────────────────────────────────")
+              for bc in buildconfigs:
+                  lines.append(f"\n  [{bc.relative_to(ROOT)}]")
+                  lines.append(bc.read_text(errors="ignore"))
+
           if not any_found:
               lines.append("  ⚠️ No credentials matched — try manual search")
+              lines.append("")
+              lines.append("  💡 Check BuildConfig.java above for hardcoded values")
 
           OUT.write_text("\n".join(lines), encoding="utf-8")
           print("\n".join(lines))
