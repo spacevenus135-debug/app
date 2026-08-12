@@ -1,89 +1,291 @@
-name: Build APK from ZIP
+name: Build StopClock APK
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:          # lets you trigger it manually from the GitHub UI
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Permissions
+# ─────────────────────────────────────────────────────────────────────────────
+permissions:
+  contents: write            # needed to create a GitHub Release & upload APK
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Environment-wide constants
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  JAVA_VERSION: '17'
+  BUILD_TOOLS_VERSION: '34.0.0'
+  COMPILE_SDK: '34'
 
 jobs:
-  build:
+  # ───────────────────────────────────────────────────────────────────────────
+  #  JOB 1 — Validate the project can be resolved before actually building
+  # ───────────────────────────────────────────────────────────────────────────
+  validate:
+    name: Validate Gradle Config
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - name: List root files
-        run: |
-          echo "📁 Files in root:"
-          ls -la
-
-      - name: Unzip StopClock.zip
-        run: |
-          if [ -f "StopClock.zip" ]; then
-            echo "📦 Extracting StopClock.zip..."
-            unzip StopClock.zip
-            echo "✅ Extraction complete!"
-          else
-            echo "❌ StopClock.zip not found in root!"
-            echo "📁 Available files:"
-            ls -la
-            exit 1
-          fi
-
-      - name: List extracted files
-        run: |
-          echo "📁 After extraction:"
-          ls -la
-          echo ""
-          echo "📁 Checking for stopclock folder:"
-          ls -la stopclock/ 2>/dev/null || echo "❌ stopclock folder not found!"
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v3
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
         with:
-          java-version: '17'
+          java-version: ${{ env.JAVA_VERSION }}
           distribution: 'temurin'
+          cache: 'gradle'
 
       - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Validate Gradle wrapper
+        uses: gradle/wrapper-validation-action@v2
+
+      - name: Check Gradle dependencies resolve
+        run: ./gradlew dependencies --configuration releaseRuntimeClasspath --no-daemon
+
+  # ───────────────────────────────────────────────────────────────────────────
+  #  JOB 2 — Build debug + release APKs
+  # ───────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    needs: validate
+
+    outputs:
+      version_name: ${{ steps.version.outputs.version_name }}
+      version_code: ${{ steps.version.outputs.version_code }}
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # full history so git describe works
+
+      # ── Java ────────────────────────────────────────────────────────────────
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      # ── Kotlin / AGP cache ──────────────────────────────────────────────────
+      - name: Cache Gradle caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.android/build-cache
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # ── SDK ────────────────────────────────────────────────────────────────
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install required SDK components
         run: |
-          if [ -f "stopclock/gradlew" ]; then
-            chmod +x stopclock/gradlew
-            echo "✅ Found gradlew in stopclock/"
-          elif [ -f "StopClock/gradlew" ]; then
-            chmod +x StopClock/gradlew
-            echo "✅ Found gradlew in StopClock/"
-          elif [ -f "gradlew" ]; then
-            chmod +x gradlew
-            echo "✅ Found gradlew in root"
-          else
-            echo "❌ gradlew not found anywhere!"
-            echo "📁 Searching for gradlew:"
-            find . -name "gradlew" 2>/dev/null || echo "No gradlew found"
-            exit 1
-          fi
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${{ env.COMPILE_SDK }}" \
+            "build-tools;${{ env.BUILD_TOOLS_VERSION }}"
+
+      # ── Version info ────────────────────────────────────────────────────────
+      - name: Extract version from build.gradle
+        id: version
+        run: |
+          VERSION_NAME=$(grep 'versionName' app/build.gradle | head -1 | sed 's/.*versionName "\(.*\)"/\1/' | tr -d ' ')
+          VERSION_CODE=$(grep 'versionCode' app/build.gradle | head -1 | sed 's/.*versionCode \([0-9]*\).*/\1/' | tr -d ' ')
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "version_code=$VERSION_CODE"  >> $GITHUB_OUTPUT
+          echo "Version: $VERSION_NAME ($VERSION_CODE)"
+
+      # ── Build ───────────────────────────────────────────────────────────────
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
 
       - name: Build Debug APK
-        run: |
-          if [ -d "stopclock" ]; then
-            echo "📂 Building from stopclock folder..."
-            cd stopclock
-            ./gradlew assembleDebug
-          elif [ -d "StopClock" ]; then
-            echo "📂 Building from StopClock folder..."
-            cd StopClock
-            ./gradlew assembleDebug
-          else
-            echo "📂 Building from root..."
-            ./gradlew assembleDebug
-          fi
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
 
-      - name: Find and Upload APK
-        uses: actions/upload-artifact@v3
+      - name: Build Release APK (unsigned)
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      # ── Rename APKs ─────────────────────────────────────────────────────────
+      - name: Rename APKs with version stamp
+        run: |
+          VERSION="${{ steps.version.outputs.version_name }}"
+          BUILD="${{ github.run_number }}"
+
+          mv app/build/outputs/apk/debug/app-debug.apk \
+             app/build/outputs/apk/debug/StopClock-${VERSION}-build${BUILD}-debug.apk || true
+
+          mv app/build/outputs/apk/release/app-release-unsigned.apk \
+             app/build/outputs/apk/release/StopClock-${VERSION}-build${BUILD}-release-unsigned.apk || true
+
+      # ── APK info ────────────────────────────────────────────────────────────
+      - name: Print APK metadata
+        run: |
+          echo "=== Debug APK ==="
+          ls -lh app/build/outputs/apk/debug/*.apk 2>/dev/null || echo "Not found"
+
+          echo ""
+          echo "=== Release APK ==="
+          ls -lh app/build/outputs/apk/release/*.apk 2>/dev/null || echo "Not found"
+
+          echo ""
+          echo "=== aapt dump badging (debug) ==="
+          $ANDROID_HOME/build-tools/${{ env.BUILD_TOOLS_VERSION }}/aapt \
+            dump badging app/build/outputs/apk/debug/*.apk 2>/dev/null | grep -E "^(package|sdkVersion|application-label)" || true
+
+      # ── Upload artifacts ────────────────────────────────────────────────────
+      - name: Upload Debug APK artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: StopClock-debug
-          path: |
-            stopclock/app/build/outputs/apk/debug/*.apk
-            StopClock/app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/debug/*.apk
-            **/build/outputs/apk/debug/*.apk
+          name: StopClock-debug-build${{ github.run_number }}
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+      - name: Upload Release APK artifact (unsigned)
+        uses: actions/upload-artifact@v4
+        with:
+          name: StopClock-release-unsigned-build${{ github.run_number }}
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
+
+  # ───────────────────────────────────────────────────────────────────────────
+  #  JOB 3 — Sign the release APK (only on main/master push)
+  #
+  #  Required repository secrets (Settings → Secrets and variables → Actions):
+  #    KEYSTORE_BASE64   — base64-encoded .jks / .keystore file
+  #    KEYSTORE_PASSWORD — the keystore password
+  #    KEY_ALIAS         — the key alias inside the keystore
+  #    KEY_PASSWORD      — the key password (can equal KEYSTORE_PASSWORD)
+  #
+  #  To generate a debug keystore and encode it:
+  #    keytool -genkey -v -keystore stopclock.jks -alias stopclock \
+  #            -keyalg RSA -keysize 2048 -validity 10000
+  #    base64 -i stopclock.jks | pbcopy   # macOS; use xclip on Linux
+  #
+  # ───────────────────────────────────────────────────────────────────────────
+  sign:
+    name: Sign Release APK
+    runs-on: ubuntu-latest
+    needs: build
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+      secrets.KEYSTORE_BASE64 != ''
+
+    steps:
+      - name: Download unsigned release APK
+        uses: actions/download-artifact@v4
+        with:
+          name: StopClock-release-unsigned-build${{ github.run_number }}
+          path: apk/
+
+      - name: Decode keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > stopclock.jks
+
+      - name: Set up JDK for jarsigner
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: Set up Android SDK (build-tools for zipalign)
+        uses: android-actions/setup-android@v3
+
+      - name: Install build-tools
+        run: sdkmanager "build-tools;${{ env.BUILD_TOOLS_VERSION }}"
+
+      - name: Sign APK
+        run: |
+          UNSIGNED=$(ls apk/*.apk | head -1)
+          SIGNED="apk/StopClock-${{ needs.build.outputs.version_name }}-build${{ github.run_number }}-release-signed.apk"
+          ALIGNED="apk/StopClock-${{ needs.build.outputs.version_name }}-build${{ github.run_number }}-release-signed-aligned.apk"
+
+          # Sign with jarsigner (v1 + v2 schemes)
+          jarsigner \
+            -verbose \
+            -sigalg SHA256withRSA \
+            -digestalg SHA-256 \
+            -keystore stopclock.jks \
+            -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+            -keypass   "${{ secrets.KEY_PASSWORD }}" \
+            -signedjar "$SIGNED" \
+            "$UNSIGNED" \
+            "${{ secrets.KEY_ALIAS }}"
+
+          # Zipalign (mandatory for Play Store / sideloading)
+          $ANDROID_HOME/build-tools/${{ env.BUILD_TOOLS_VERSION }}/zipalign \
+            -v 4 "$SIGNED" "$ALIGNED"
+
+          # Verify signature
+          $ANDROID_HOME/build-tools/${{ env.BUILD_TOOLS_VERSION }}/apksigner \
+            verify --verbose "$ALIGNED"
+
+          echo "SIGNED_APK=$ALIGNED" >> $GITHUB_ENV
+
+      - name: Upload signed APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StopClock-release-signed-build${{ github.run_number }}
+          path: apk/*-signed-aligned.apk
+          retention-days: 60
+
+      # ── Create GitHub Release on version tags ──────────────────────────────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "StopClock v${{ needs.build.outputs.version_name }}"
+          body: |
+            ## StopClock v${{ needs.build.outputs.version_name }}
+
+            **Build:** #${{ github.run_number }}
+            **Commit:** ${{ github.sha }}
+
+            ### Install
+            Download `*-signed-aligned.apk` below and sideload it.
+            Make sure "Install from unknown sources" is enabled.
+
+            ### Changes
+            ${{ github.event.head_commit.message }}
+          files: apk/*-signed-aligned.apk
+          draft: false
+          prerelease: false
+
+  # ───────────────────────────────────────────────────────────────────────────
+  #  JOB 4 — Notify build status (always runs)
+  # ───────────────────────────────────────────────────────────────────────────
+  notify:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: [ build, sign ]
+    if: always()
+
+    steps:
+      - name: Print build summary
+        run: |
+          echo "## StopClock CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field        | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build #      | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch       | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit       | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build job    | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Sign job     | ${{ needs.sign.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "APK artifacts are attached to this workflow run." >> $GITHUB_STEP_SUMMARY
