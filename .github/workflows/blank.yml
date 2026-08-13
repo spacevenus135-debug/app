@@ -1,172 +1,313 @@
-name: Boosteroid APK Extract
+# .github/workflows/ipa-extract.yml
+
+name: IPA API Extractor — Crunchyroll
 
 on:
+  push:
+    paths:
+      - 'Crunchyroll.ipa'
   workflow_dispatch:
+    inputs:
+      ipa_filename:
+        description: 'IPA filename'
+        required: true
+        default: 'Crunchyroll.ipa'
 
 jobs:
   extract:
+    name: Extract APIs from Crunchyroll.ipa
     runs-on: ubuntu-latest
 
     steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
+      # ── 2. Python setup ──────────────────────────────────────────────────
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          distribution: temurin
-          java-version: '17'
+          python-version: '3.11'
 
-      - name: Download JADX (fixed version)
+      # ── 3. Install deps ──────────────────────────────────────────────────
+      - name: Install dependencies
         run: |
-          JADX_VERSION="1.4.7"
-          echo "📦 Downloading JADX v${JADX_VERSION}..."
-          curl -L "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" \
-            -o jadx.zip
-          unzip -q jadx.zip -d jadx
-          chmod +x jadx/bin/jadx
-          echo "$PWD/jadx/bin" >> $GITHUB_PATH
-          echo "✅ JADX installed successfully"
+          pip install --upgrade pip
+          pip install plistlib click rich
 
-      - name: List APK files in repo
+      # ── 4. Verify IPA exists ─────────────────────────────────────────────
+      - name: Verify Crunchyroll.ipa
         run: |
-          echo "📁 Looking for APK files..."
-          find . -name "*.apk" -type f
-          echo ""
-          echo "📁 All files in root:"
-          ls -la
-
-      - name: Decompile APK from repo
-        run: |
-          # ابحث عن أي ملف APK في المستودع
-          APK_FILE=$(find . -name "*.apk" -type f | head -1)
-          if [ -z "$APK_FILE" ]; then
-            echo "❌ No APK file found in repository!"
-            echo "📁 Please upload an APK file to the repository root."
+          if [ ! -f "Crunchyroll.ipa" ]; then
+            echo "❌ Crunchyroll.ipa not found in repo root"
             exit 1
           fi
-          echo "📱 Found APK: $APK_FILE"
-          echo "📏 Size: $(du -h "$APK_FILE" | cut -f1)"
-          
-          echo "🔧 Decompiling APK..."
-          jadx/bin/jadx --threads-count 4 --output-dir decompiled "$APK_FILE"
-          echo "✅ Decompiled $(find decompiled -name '*.java' | wc -l) Java files"
+          echo "✅ Found: Crunchyroll.ipa"
+          ls -lh Crunchyroll.ipa
 
-      - name: Extract Client ID & Secret
+      # ── 5. Write extractor script ────────────────────────────────────────
+      - name: Write extractor
         run: |
-          python3 << 'PYEOF'
-          import os, re, json
+          cat > extractor.py << 'PYEOF'
+          import zipfile, os, re, json, sys, plistlib
           from pathlib import Path
-
-          ROOT = Path("decompiled")
-          OUT  = Path("credentials.txt")
-          JSON = Path("credentials.json")
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from dataclasses import dataclass, field
+          from typing import Optional
 
           PATTERNS = {
-              "client_id": [
-                  r'client[_-]?id["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-\.]{6,})',
-                  r'clientId["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-\.]{6,})',
-                  r'CLIENT_ID["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-\.]{6,})',
-                  r'app[_-]?id["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-\.]{6,})',
+              "urls": [
+                  r'https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]{6,}',
+                  r'wss?://[a-zA-Z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]{6,}',
               ],
-              "client_secret": [
-                  r'client[_-]?secret["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9+/=_\-]{8,})',
-                  r'clientSecret["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9+/=_\-]{8,})',
-                  r'CLIENT_SECRET["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9+/=_\-]{8,})',
-                  r'app[_-]?secret["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9+/=_\-]{8,})',
+              "api_keys": [
+                  r'(?i)api[_\-]?key["\s:=]+([A-Za-z0-9\-_]{16,})',
+                  r'(?i)x-api-key["\s:=]+([A-Za-z0-9\-_]{16,})',
+                  r'(?i)token["\s:=]+([A-Za-z0-9\-_\.]{16,})',
+                  r'(?i)bearer\s+([A-Za-z0-9\-_\.]{16,})',
+                  r'(?i)secret["\s:=]+([A-Za-z0-9\-_]{16,})',
+                  r'(?i)client[_\-]?id["\s:=]+([A-Za-z0-9\-_]{8,})',
+                  r'(?i)client[_\-]?secret["\s:=]+([A-Za-z0-9\-_]{16,})',
               ],
-              "api_key": [
-                  r'api[_-]?key["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-]{10,})',
-                  r'API_KEY["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-]{10,})',
-                  r'apiKey["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9_\-]{10,})',
+              "aws": [
+                  r'AKIA[0-9A-Z]{16}',
+                  r'(?i)aws[_\-]?secret["\s:=]+([A-Za-z0-9/+=]{40})',
               ],
-              "oauth_token": [
-                  r'Bearer\s+([A-Za-z0-9\._\-]{20,})',
-                  r'access[_-]?token["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9\._\-]{20,})',
-                  r'oauth[_-]?token["\'`\s]*[:=]+["\'`\s]*([A-Za-z0-9\._\-]{20,})',
+              "firebase": [
+                  r'AIza[0-9A-Za-z\-_]{35}',
+                  r'(?i)firebaseio\.com[/a-zA-Z0-9\-_]*',
               ],
-              "base_url": [
-                  r'(https?://[a-zA-Z0-9._\-]+\.boosteroid[^\s"\'`<>]{0,60})',
-                  r'BASE_URL["\'`\s]*[:=]+["\'`\s]*(https?://[^\s"\'`]{8,})',
-                  r'baseUrl["\'`\s]*[:=]+["\'`\s]*(https?://[^\s"\'`]{8,})',
+              "endpoints": [
+                  r'/api/v\d+/[a-zA-Z0-9/_\-]+',
+                  r'/v\d+/[a-zA-Z0-9/_\-]{3,}',
+                  r'(?i)/graphql[a-zA-Z0-9/_\-]*',
+                  r'(?i)/rest/[a-zA-Z0-9/_\-]+',
+                  r'(?i)/auth/[a-zA-Z0-9/_\-]+',
+                  r'(?i)/oauth[a-zA-Z0-9/_\-]*',
+                  r'(?i)/stream[a-zA-Z0-9/_\-]*',
+                  r'(?i)/video[a-zA-Z0-9/_\-]*',
+                  r'(?i)/cdn[a-zA-Z0-9/_\-]*',
+              ],
+              "jwt": [
+                  r'eyJ[A-Za-z0-9\-_]+\.eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+',
+              ],
+              "headers": [
+                  r'(?i)x-[a-z\-]+["\s:=]+([A-Za-z0-9\-_]{6,})',
+                  r'(?i)authorization["\s:=]+([A-Za-z0-9\-_ ]{6,})',
+                  r'(?i)content-type["\s:=]+([a-z/\-]+)',
+              ],
+              "crunchyroll_specific": [
+                  r'crunchyroll[a-zA-Z0-9\-_\.]*',
+                  r'(?i)funimation[a-zA-Z0-9\-_\.]*',
+                  r'(?i)vrv\.[a-zA-Z0-9\-_\.]+',
+                  r'(?i)subscription["\s:=]+([a-zA-Z0-9\-_]+)',
+                  r'(?i)drm[_\-]?key["\s:=]+([A-Za-z0-9\-_]{8,})',
+                  r'(?i)widevine[a-zA-Z0-9\-_\.]*',
+                  r'(?i)playready[a-zA-Z0-9\-_\.]*',
               ],
           }
 
-          found = {k: {} for k in PATTERNS}
-          exts = {".java", ".kt", ".xml", ".json", ".smali", ".properties", ".gradle"}
+          @dataclass
+          class Finding:
+              category: str
+              value: str
+              source_file: str
+              line_hint: Optional[str] = None
 
-          for fpath in ROOT.rglob("*"):
-              if not fpath.is_file(): continue
-              if fpath.suffix.lower() not in exts: continue
-              try:
-                  content = fpath.read_text(errors="ignore")
-              except Exception:
-                  continue
-              rel = str(fpath.relative_to(ROOT))
-              for key, pats in PATTERNS.items():
-                  for pat in pats:
-                      for m in re.finditer(pat, content, re.IGNORECASE):
-                          val = m.group(1).strip().strip('"\'`')
-                          if len(val) < 4: continue
-                          if val not in found[key]:
-                              found[key][val] = []
-                          if rel not in found[key][val]:
-                              found[key][val].append(rel)
+          @dataclass
+          class ExtractionResult:
+              ipa_path: str
+              app_name: str = ""
+              bundle_id: str = ""
+              findings: list = field(default_factory=list)
+              binary_strings: list = field(default_factory=list)
+              plist_data: dict = field(default_factory=dict)
 
-          lines = []
-          lines.append("╔══════════════════════════════════════════════════╗")
-          lines.append("║       Boosteroid Credential Extraction           ║")
-          lines.append("╚══════════════════════════════════════════════════╝")
-          lines.append("")
+          class IPAExtractor:
+              def __init__(self, ipa_path, output_dir="ipa_output"):
+                  self.ipa_path = Path(ipa_path)
+                  self.output_dir = Path(output_dir)
+                  self.result = ExtractionResult(ipa_path=str(ipa_path))
+                  self.seen = set()
 
-          any_found = False
-          for key, vals in found.items():
-              if not vals: continue
-              any_found = True
-              lines.append(f"── {key.upper().replace('_',' ')} " + "─"*(46-len(key)))
-              for val, files in vals.items():
-                  lines.append(f"  VALUE : {val}")
-                  for f in files[:3]:
-                      lines.append(f"  FILE  : {f}")
-                  lines.append("")
+              def run(self):
+                  print(f"[*] Loading: {self.ipa_path.name}")
+                  self.output_dir.mkdir(parents=True, exist_ok=True)
+                  with zipfile.ZipFile(self.ipa_path, 'r') as zf:
+                      members = zf.namelist()
+                      zf.extractall(self.output_dir)
+                  print(f"[*] Extracted {len(members)} files")
+                  self._parse_plists()
+                  self._scan_text_files()
+                  self._scan_binaries()
+                  self._save_results()
+                  self._print_summary()
 
-          # BuildConfig files
-          buildconfigs = list(ROOT.rglob("BuildConfig.java"))
-          if buildconfigs:
-              lines.append("── BUILDCONFIG.JAVA ────────────────────────────────")
-              for bc in buildconfigs:
-                  lines.append(f"\n  [{bc.relative_to(ROOT)}]")
-                  lines.append(bc.read_text(errors="ignore"))
+              def _parse_plists(self):
+                  for plist_file in self.output_dir.rglob("*.plist"):
+                      try:
+                          with open(plist_file, 'rb') as f:
+                              data = plistlib.load(f)
+                          self._flatten_plist(data, str(plist_file))
+                          if "CFBundleIdentifier" in data:
+                              self.result.bundle_id = data["CFBundleIdentifier"]
+                          if "CFBundleDisplayName" in data:
+                              self.result.app_name = data["CFBundleDisplayName"]
+                      except Exception:
+                          pass
 
-          if not any_found:
-              lines.append("  ⚠️ No credentials matched — try manual search")
-              lines.append("")
-              lines.append("  💡 Check BuildConfig.java above for hardcoded values")
+              def _flatten_plist(self, obj, source, prefix=""):
+                  if isinstance(obj, dict):
+                      for k, v in obj.items():
+                          self._flatten_plist(v, source, prefix=k)
+                  elif isinstance(obj, list):
+                      for item in obj:
+                          self._flatten_plist(item, source, prefix)
+                  elif isinstance(obj, str):
+                      self._scan_string(obj, source, context=prefix)
 
-          OUT.write_text("\n".join(lines), encoding="utf-8")
-          print("\n".join(lines))
+              def _scan_text_files(self):
+                  extensions = {'.js','.json','.xml','.html','.txt',
+                                 '.strings','.plist','.yaml','.yml',
+                                 '.config','.cfg','.env'}
+                  files = [f for f in self.output_dir.rglob("*")
+                           if f.suffix.lower() in extensions and f.is_file()]
+                  print(f"[*] Scanning {len(files)} text files...")
+                  with ThreadPoolExecutor(max_workers=8) as ex:
+                      futures = {ex.submit(self._scan_text_file, f): f for f in files}
+                      for fut in as_completed(futures):
+                          fut.result()
 
-          clean_json = {}
-          for key, vals in found.items():
-              if vals:
-                  clean_json[key] = list(vals.keys())
-          JSON.write_text(json.dumps(clean_json, indent=2, ensure_ascii=False), encoding="utf-8")
-          print(f"✅ Saved: {OUT}")
-          print(f"✅ Saved: {JSON}")
+              def _scan_text_file(self, path):
+                  try:
+                      content = path.read_text(encoding='utf-8', errors='ignore')
+                      for line in content.splitlines():
+                          self._scan_string(line, str(path), context=line[:80])
+                  except Exception:
+                      pass
+
+              def _scan_binaries(self):
+                  payload = self.output_dir / "Payload"
+                  if not payload.exists():
+                      return
+                  for app_dir in payload.iterdir():
+                      if app_dir.suffix == ".app":
+                          binary_name = app_dir.name.replace(".app", "")
+                          binary_path = app_dir / binary_name
+                          if binary_path.exists():
+                              print(f"[*] Scanning binary: {binary_name}")
+                              self._extract_binary_strings(binary_path)
+
+              def _extract_binary_strings(self, path):
+                  try:
+                      data = path.read_bytes()
+                      strings = re.findall(rb'[ -~]{6,}', data)
+                      decoded = [s.decode('ascii', errors='ignore') for s in strings]
+                      print(f"[*] {len(decoded)} strings from binary")
+                      for s in decoded:
+                          self._scan_string(s, str(path), context="[binary]")
+                  except Exception as e:
+                      print(f"[!] Binary error: {e}")
+
+              def _scan_string(self, text, source, context=""):
+                  for category, patterns in PATTERNS.items():
+                      for pattern in patterns:
+                          matches = re.findall(pattern, text)
+                          for match in matches:
+                              val = match.strip() if isinstance(match, str) else match
+                              if len(val) < 4:
+                                  continue
+                              key = f"{category}:{val}"
+                              if key in self.seen:
+                                  continue
+                              self.seen.add(key)
+                              self.result.findings.append(Finding(
+                                  category=category,
+                                  value=val,
+                                  source_file=source.replace(str(self.output_dir), ''),
+                                  line_hint=context[:120] if context else None
+                              ))
+
+              def _save_results(self):
+                  by_cat = {}
+                  for f in self.result.findings:
+                      by_cat.setdefault(f.category, []).append({
+                          "value": f.value,
+                          "file": f.source_file,
+                          "context": f.line_hint
+                      })
+                  out = {
+                      "app_name": self.result.app_name,
+                      "bundle_id": self.result.bundle_id,
+                      "total_findings": len(self.result.findings),
+                      "findings_by_category": by_cat,
+                  }
+                  report = self.output_dir / "api_report.json"
+                  report.write_text(json.dumps(out, indent=2, ensure_ascii=False))
+                  txt = self.output_dir / "api_report.txt"
+                  with open(txt, 'w') as f:
+                      f.write(f"Crunchyroll IPA — API Extraction Report\n{'='*50}\n")
+                      f.write(f"App    : {self.result.app_name}\n")
+                      f.write(f"Bundle : {self.result.bundle_id}\n")
+                      f.write(f"Total  : {len(self.result.findings)} findings\n\n")
+                      for cat, items in by_cat.items():
+                          f.write(f"\n[{cat.upper()}] — {len(items)}\n{'-'*40}\n")
+                          for item in items:
+                              f.write(f"  {item['value']}\n")
+                              if item['file']:
+                                  f.write(f"    → {item['file']}\n")
+                  print(f"[+] Saved → {report}")
+                  print(f"[+] Saved → {txt}")
+
+              def _print_summary(self):
+                  by_cat = {}
+                  for f in self.result.findings:
+                      by_cat.setdefault(f.category, []).append(f.value)
+                  print(f"\n{'='*50}")
+                  print(f"  App    : {self.result.app_name or 'unknown'}")
+                  print(f"  Bundle : {self.result.bundle_id or 'unknown'}")
+                  print(f"  Total  : {len(self.result.findings)} findings")
+                  print(f"{'='*50}")
+                  for cat, vals in by_cat.items():
+                      print(f"  {cat:<25} {len(vals)}")
+                  print(f"{'='*50}\n")
+
+          extractor = IPAExtractor("Crunchyroll.ipa", "ipa_output")
+          extractor.run()
           PYEOF
 
-      - name: Upload credentials
+      # ── 6. Run extraction ────────────────────────────────────────────────
+      - name: Run extraction
+        run: python3 extractor.py
+
+      # ── 7. Upload JSON report ────────────────────────────────────────────
+      - name: Upload JSON report
         uses: actions/upload-artifact@v4
         with:
-          name: boosteroid-credentials
-          path: |
-            credentials.txt
-            credentials.json
+          name: crunchyroll-api-report-json
+          path: ipa_output/api_report.json
+          retention-days: 30
+
+      # ── 8. Upload TXT report ─────────────────────────────────────────────
+      - name: Upload TXT report
+        uses: actions/upload-artifact@v4
+        with:
+          name: crunchyroll-api-report-txt
+          path: ipa_output/api_report.txt
+          retention-days: 30
+
+      # ── 9. Upload full output dir ────────────────────────────────────────
+      - name: Upload full extraction output
+        uses: actions/upload-artifact@v4
+        with:
+          name: crunchyroll-full-extraction
+          path: ipa_output/
           retention-days: 7
 
-      - name: Summary
+      # ── 10. Print report to logs ─────────────────────────────────────────
+      - name: Print report summary
         run: |
-          echo "### 🔑 Extracted Credentials" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat credentials.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "       CRUNCHYROLL EXTRACTION DONE"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          cat ipa_output/api_report.txt
