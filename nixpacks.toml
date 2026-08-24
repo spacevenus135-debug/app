@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["python313"]
+
+[phases.install]
+cmds = [
+  "python -m venv /app/.venv",
+  "/app/.venv/bin/pip install --no-cache-dir --force-reinstall -r requirements.txt"
+]
+
+[start]
+cmd = "/app/.venv/bin/python main.py"
